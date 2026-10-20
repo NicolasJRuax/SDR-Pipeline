@@ -1,0 +1,250 @@
+  GNU nano 7.2                                                                                           ANTS.c                                                                                                    #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <signal.h>
+#include <string.h>
+#include <iio.h>
+
+// ============================================================
+// PARÁMETROS RF (AJUSTABLES)
+// ============================================================
+#define TX_LO_FREQ     5800000000LL   // 5.8 GHz
+#define SAMPLE_RATE    30720000LL     // 30.72 MSPS
+#define RF_BANDWIDTH   10000000LL     // 10 MHz
+#define TX_GAIN_DB     -5             // dB (negativo = menos potencia)
+
+// ============================================================
+// BUFFER
+// ============================================================
+#define BUFFER_SAMPLES 16384          // muestras complejas
+
+static volatile int running = 1;
+
+// ============================================================
+// SIGINT handler
+// ============================================================
+static void handle_sigint(int sig)
+{
+    (void)sig;
+    running = 0;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+int main(int argc, char **argv)
+{
+    signal(SIGINT, handle_sigint);
+
+    if (argc < 2) {
+        fprintf(stderr, "Uso: %s archivo_iq.bin\n", argv[0]);
+        return 1;
+    }
+
+    // ========================================================
+    // Abrir archivo BIN
+    // ========================================================
+  FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        perror("fopen");
+        return 1;
+    }
+    printf("[OK] Archivo BIN abierto: %s\n", argv[1]);
+
+    // ========================================================
+    // Crear contexto IIO
+    // ========================================================
+    struct iio_context *ctx =
+        iio_create_context_from_uri("ip:192.168.1.10");
+
+    if (!ctx) {
+        fprintf(stderr, "[ERROR] No se pudo crear contexto IIO\n");
+        fclose(f);
+        return 1;
+    }
+
+    printf("[OK] Contexto IIO: %s\n",
+           iio_context_get_description(ctx));
+
+    // ========================================================
+    // Dispositivos
+    // ========================================================
+    struct iio_device *phy =
+        iio_context_find_device(ctx, "ad9361-phy");
+    struct iio_device *tx =
+        iio_context_find_device(ctx, "cf-ad9361-dds-core-lpc");
+
+    if (!phy || !tx) {
+        fprintf(stderr, "[ERROR] Dispositivos no encontrados\n");
+        goto cleanup_ctx;
+    }
+
+    printf("[OK] Dispositivos PHY y TX encontrados\n");
+
+    // ========================================================
+    // Canales PHY TX
+    // ========================================================
+    struct iio_channel *tx_lo =
+        iio_device_find_channel(phy, "altvoltage1", true);
+    struct iio_channel *tx_gain =
+        iio_device_find_channel(phy, "voltage0", true);
+
+    if (!tx_lo || !tx_gain) {
+        fprintf(stderr,
+                "[ERROR] Canales PHY TX no encontrados\n");
+        goto cleanup_ctx;
+    }
+
+    // ========================================================
+    // Configuración RF (AD9361)
+    // ========================================================
+    iio_channel_attr_write_longlong(
+        tx_lo, "frequency", TX_LO_FREQ);
+
+    iio_device_attr_write_longlong(
+        tx, "sampling_frequency", SAMPLE_RATE);
+
+    iio_channel_attr_write_longlong(
+        tx_gain, "rf_bandwidth", RF_BANDWIDTH);
+
+    iio_channel_attr_write_longlong(
+        tx_gain, "hardwaregain", TX_GAIN_DB);
+
+    iio_channel_attr_write_bool(tx_gain, "quadrature_tracking_en", false);
+    iio_channel_attr_write_bool(tx_gain, "bb_dc_offset_tracking_en", false);
+
+    printf("[CFG] TX LO = %.3f MHz\n", TX_LO_FREQ / 1e6);
+    printf("[CFG] Sample rate = %.2f MSPS\n", SAMPLE_RATE / 1e6);
+    printf("[CFG] RF BW = %.2f MHz\n", RF_BANDWIDTH / 1e6);
+    printf("[CFG] TX Gain = %d dB\n", TX_GAIN_DB);
+
+
+
+
+    // ========================================================
+    // Desactivar DDS
+    // ========================================================	
+
+    const char *dds_chans[] = {
+        "TX1_I_F1", "TX1_I_F2",
+        "TX1_Q_F1", "TX1_Q_F"
+};
+
+    for( int i = 0; i < 4; i++) {
+        struct iio_channel *ch =
+            iio_device_find_channel(tx, dds_chans[i], true);
+
+        if (ch) {
+            iio_channel_attr_write_double(ch, "scale", 0.0);
+            iio_channel_attr_write_longlong(ch, "frequency", 0);
+        }
+}
+
+    // ========================================================
+    // Canales I/Q TX (STREAMING)
+    // ========================================================
+    struct iio_channel *i_ch =
+        iio_device_find_channel(tx, "voltage0", true);
+    struct iio_channel *q_ch =
+        iio_device_find_channel(tx, "voltage1", true);
+
+    if (!i_ch || !q_ch) {
+        fprintf(stderr,
+                "[ERROR] Canales I/Q TX no encontrados\n");
+        goto cleanup_ctx;
+    }
+
+    iio_channel_enable(i_ch);
+    iio_channel_enable(q_ch);
+
+    printf("[OK] Canales TX I/Q habilitados\n");
+
+    // ========================================================
+    // Crear buffer IIO
+    // ========================================================
+
+    iio_device_attr_write_bool(tx, "sync_start_enable", false);
+
+    struct iio_buffer *iio_buf =
+        iio_device_create_buffer(tx, BUFFER_SAMPLES, false);
+
+    if (!iio_buf) {
+        fprintf(stderr,
+                "[ERROR] No se pudo crear buffer IIO\n");
+        goto cleanup_channels;
+    }
+
+    printf("[OK] Buffer IIO creado (%d muestras)\n",
+           BUFFER_SAMPLES);
+
+    iio_device_attr_write_bool(tx, "sync_start_enable", true);
+
+    // ========================================================
+    // Buffer IQ de usuario
+    // ========================================================
+    int16_t *iq_buf =
+        malloc(2 * BUFFER_SAMPLES * sizeof(int16_t));
+
+    if (!iq_buf) {
+        fprintf(stderr, "[ERROR] No hay memoria\n");
+        goto cleanup_buf;
+    }
+
+    printf("[TX] Transmitiendo (Ctrl+C para salir)...\n");
+
+    // ========================================================
+    // LOOP TX
+    // ========================================================
+    // ========================================================
+    while (running) {
+        size_t r = fread(
+            iq_buf,
+            sizeof(int16_t),
+            2 * BUFFER_SAMPLES,
+            f
+        );
+
+        if (r < 2 * BUFFER_SAMPLES) {
+            fseek(f, 0, SEEK_SET);
+            continue;
+        }
+
+        char *p_i = iio_buffer_first(iio_buf, i_ch);
+        char *p_q = iio_buffer_first(iio_buf, q_ch);
+        ptrdiff_t step = iio_buffer_step(iio_buf);
+
+        for (int n = 0; n < BUFFER_SAMPLES; n++) {
+            *(int16_t *)p_i = iq_buf[2 * n];
+            *(int16_t *)p_q = iq_buf[2 * n + 1];
+            p_i += step;
+            p_q += step;
+        }
+
+        if (iio_buffer_push(iio_buf) < 0) {
+            fprintf(stderr,
+                    "[ERROR] iio_buffer_push falló\n");
+            break;
+        }
+    }
+
+    printf("\n[INFO] Parando transmisión...\n");
+    // ========================================================
+    // LIMPIEZA
+    // ========================================================
+    free(iq_buf);
+
+cleanup_buf:
+    iio_buffer_destroy(iio_buf);
+
+cleanup_channels:
+    iio_channel_disable(i_ch);
+    iio_channel_disable(q_ch);
+
+cleanup_ctx:
+    iio_context_destroy(ctx);
+    fclose(f);
+
+    printf("[OK] Recursos liberados correctamente\n");
+    return 0;
+}

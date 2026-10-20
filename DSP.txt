@@ -1,0 +1,100 @@
+import numpy as np
+import os
+from scipy.signal import resample_poly, firwin, lfilter
+
+
+def iq_to_bin_ad9361(
+        input_iq_path,
+        output_bin_path,
+        fs_in=100_000_000,
+        fs_out=30_720_000,
+        tx_bandwidth=10_000_000,
+):
+    """
+    Convierte IQ complex float32 (100 MSPS) a BIN int16
+    compatible con AD9361 / ANTSDR.
+
+    - Filtra
+    - Resamplea
+    - Normaliza
+    - Intercala I/Q
+    """
+
+    # -------------------------------------------------
+    # 1. Cargar IQ complex float32
+    # -------------------------------------------------
+    iq = np.fromfile(input_iq_path, dtype=np.complex64)
+
+    if iq.size == 0:
+        raise ValueError("Archivo IQ vacío o corrupto")
+
+    print(f"IQ cargado: {iq.size} muestras @ {fs_in/1e6:.2f} MSPS")
+
+    # -------------------------------------------------
+    # 2. Filtrado pasabajo (anti-alias)
+    # -------------------------------------------------
+    nyq = fs_in / 2
+    cutoff = tx_bandwidth / 2
+
+    num_taps = 129
+    lpf = firwin(
+        num_taps,
+        cutoff / nyq,
+        window="hamming"
+    )
+
+    iq_filt = lfilter(lpf, 1.0, iq)
+
+    # -------------------------------------------------
+    # 3. Resampling  (100 → 30.72 MSPS)
+    # -------------------------------------------------
+    #  polyphase FIR (calidad alta)
+    iq_rs = resample_poly(
+        iq_filt,
+        fs_out,
+        fs_in
+    )
+
+    print(f"Resampleado a {fs_out/1e6:.2f} MSPS")
+
+    # -------------------------------------------------
+    # 4. Normalización segura
+    # -------------------------------------------------
+    max_val = np.max(np.abs(iq_rs))
+    if max_val == 0:
+        raise ValueError("Señal nula tras resampling")
+
+    iq_rs /= max_val
+
+    # -------------------------------------------------
+    # 5. Float32 → Int16
+    # -------------------------------------------------
+    i_int16 = np.clip(np.real(iq_rs) * 32767, -32768, 32767).astype(np.int16)
+    q_int16 = np.clip(np.imag(iq_rs) * 32767, -32768, 32767).astype(np.int16)
+
+    # -------------------------------------------------
+    # 6. Intercalar I/Q
+    # -------------------------------------------------
+    iq_interleaved = np.empty(i_int16.size * 2, dtype=np.int16)
+    iq_interleaved[0::2] = i_int16
+    iq_interleaved[1::2] = q_int16
+
+    # -------------------------------------------------
+    # 7. Guardar BIN
+    # -------------------------------------------------
+    iq_interleaved.tofile(output_bin_path)
+
+    print("Conversión completada correctamente")
+    print(f"  BIN generado : {output_bin_path}")
+    print(f"  Muestras TX : {i_int16.size}")
+    print(f"  Tamaño BIN : {os.path.getsize(output_bin_path)} bytes")
+
+if __name__ == "__main__":
+
+    input_file = "pack1_2-3s.iq"
+    output_file = "Test2.bin"
+
+    iq_to_bin_ad9361(
+        input_iq_path=input_file,
+        output_bin_path=output_file
+    )

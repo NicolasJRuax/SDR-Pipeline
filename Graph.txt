@@ -1,0 +1,83 @@
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG
+# ===========================================
+# +=================
+
+FILE_TYPE = "iq"          # "bin" o "iq"
+CENTER_FREQ = 5800e6
+SAMPLE_RATE = 100e6
+SPAN = 15e6
+RBW = 100e3
+AVERAGES =  10
+
+# ============================================================
+# BUSCAR ARCHIVOS
+# ============================================================
+
+if FILE_TYPE == "bin":
+    files = sorted(Path("../VTSBW=10").glob("Test2.bin"))
+else:
+    files = sorted(Path("../VTSBW=10").glob("pack1_2-3s.iq"))
+
+if not files:
+    raise RuntimeError("No se encontraron archivos")
+
+# ============================================================
+# LEER Y UNIR IQ CORRECTAMENTE
+# ============================================================
+
+iq_all = []
+
+for f in files:
+    if FILE_TYPE == "iq":
+        raw = np.fromfile(f, dtype=np.float32)
+        i = raw[0::2]
+        q = raw[1::2]
+        iq = i + 1j*q
+
+    else:  # BIN
+        raw = np.fromfile(f, dtype=np.int16)
+        i = raw[0::2].astype(np.float32) / 32767.0
+        q = raw[1::2].astype(np.float32) / 32767.0
+        iq = i + 1j*q
+
+    iq_all.append(iq)
+
+iq = np.concatenate(iq_all)
+
+# ============================================================
+# FFT ESTILO ANALIZADOR
+# ============================================================
+
+NFFT = int(SAMPLE_RATE / RBW)
+NFFT = 2 ** int(np.log2(NFFT))
+window = np.hanning(NFFT)
+
+spec_avg = np.zeros(NFFT)
+
+for k in range(AVERAGES):
+    start = k * NFFT
+    if start + NFFT > len(iq):
+        break
+    block = iq[start:start+NFFT] * window
+    fft = np.fft.fftshift(np.fft.fft(block))
+    spec_avg += 20*np.log10(np.abs(fft) + 1e-12)
+
+spec_avg /= AVERAGES
+
+freq = np.fft.fftshift(np.fft.fftfreq(NFFT, d=1/SAMPLE_RATE))
+freq_rf = (freq + CENTER_FREQ) / 1e6
+
+mask = np.abs(freq) <= SPAN/2
+
+plt.figure(figsize=(12,5))
+plt.plot(freq_rf[mask], spec_avg[mask])
+plt.title("Espectro RF combinado (todos los segundos)")
+plt.xlabel("Frecuencia (MHz)")
+plt.ylabel("Nivel relativo (dB)")
+plt.grid(True)
+plt.show()
